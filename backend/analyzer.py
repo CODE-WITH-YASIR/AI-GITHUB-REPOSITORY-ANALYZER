@@ -1,300 +1,204 @@
+"""
+Repository Deep Analysis Engine powered by Groq.
+
+Performs structured multi-stage evaluation of repository architecture,
+code quality, security vulnerabilities, performance bottlenecks, and provides
+actionable, prioritized recommendations with verified evidence.
+"""
+
+from __future__ import annotations
+
+import json
 import os
+import re
+from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
-from google import genai
-
-
-# ============================================================
-# LOAD ENVIRONMENT VARIABLES
-# ============================================================
-
-load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not GEMINI_API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY not found. "
-        "Please check backend/.env"
-    )
+from llm_service import llm_service
 
 
 # ============================================================
-# GEMINI CLIENT
+# ANALYSIS PROMPT TEMPLATE
 # ============================================================
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+ANALYSIS_SYSTEM_PROMPT = """
+You are a Principal Software Architect, Senior Application Security Specialist, and Lead AI Engineer.
+You are performing a comprehensive, evidence-based code review of a GitHub repository.
+
+CRITICAL ACCURACY & GROUNDING RULES:
+1. Ground every finding in the provided repository files.
+2. DO NOT invent files, classes, vulnerabilities, or dependencies not present in the code.
+3. If an issue is a theoretical risk rather than an observed code bug, label it as "POTENTIAL_RISK" instead of "CONFIRMED_ISSUE".
+4. For every specific finding, cite the exact file path and relevant code logic.
+5. Provide technically actionable remediations suitable for a senior engineering team.
+"""
+
+ANALYSIS_INSTRUCTION_PROMPT = """
+Analyze the repository context provided below across these essential dimensions:
+
+1. EXECUTIVE SUMMARY
+   - Core purpose, domain, and target use case.
+
+2. ARCHITECTURAL ASSESSMENT
+   - High-level architecture, module decomposition, and data flow.
+   - Identified entry points and configuration structures.
+
+3. TECH STACK & DEPENDENCY HEALTH
+   - Languages, frameworks, and key external dependencies.
+   - Packaging and dependency hygiene observations.
+
+4. CODE QUALITY & MAINTAINABILITY
+   - Adherence to idiomatic patterns, typing, separation of concerns, and error handling.
+
+5. POTENTIAL BUGS & CODE DEFECTS
+   - Concrete defects observed in logic, exception handling, or resource lifecycles.
+
+6. SECURITY & VULNERABILITY AUDIT
+   - Sensitive data exposure, unvalidated inputs, rate limits, and network safety.
+
+7. PERFORMANCE & BOTTLENECKS
+   - Algorithmic complexity, memory consumption, unindexed queries, or blocking operations.
+
+8. OVERALL PROJECT HEALTH SCORE
+   - Provide an objective score from 1.0 to 10.0 with concise rationale across quality, security, and architecture.
+
+9. TOP 5 ACTIONABLE RECOMMENDATIONS
+   - In descending order of priority, the 5 most valuable improvements.
+
+============================================================
+STRUCTURED FINDINGS REQUIREMENTS:
+In addition to the narrative, extract all distinct findings in a structured block at the very end of your response, enclosed in:
+```json:findings
+[
+  {
+    "id": "F-01",
+    "title": "Short descriptive title",
+    "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO",
+    "category": "SECURITY" | "BUG" | "PERFORMANCE" | "QUALITY" | "ARCHITECTURE",
+    "file_path": "path/to/file.py",
+    "line_reference": "Approximate line or function name",
+    "evidence": "Brief code snippet or observed behavior",
+    "explanation": "Detailed explanation of the issue and why it happens",
+    "impact": "Potential production or developer impact",
+    "remediation": "Concrete recommended fix",
+    "confidence": "HIGH" | "MEDIUM" | "LOW",
+    "is_confirmed": true | false
+  }
+]
+```
+"""
 
 
-# ============================================================
-# GEMINI MODEL
-# ============================================================
+def extract_structured_findings(report_text: str) -> List[Dict[str, Any]]:
+    """Extract and parse structured JSON findings from the LLM report."""
+    match = re.search(r"```json:findings\s*([\s\S]*?)\s*```", report_text)
+    if not match:
+        # Fallback search for general json array
+        match = re.search(r"(\[\s*\{\s*\"id\":\s*\"F-[\s\S]*?\}\s*\])", report_text)
+    if match:
+        try:
+            parsed = json.loads(match.group(1).strip())
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return []
 
-MODEL_NAME = "gemini-3-flash-preview"
 
-
-# ============================================================
-# ANALYZE REPOSITORY
-# ============================================================
-
-def analyze_repository(files_content):
+def analyze_repository(
+    files_content: Dict[str, str],
+    repo_name: str = "Repository",
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Analyze the indexed GitHub repository using Gemini.
-
-    Parameters
-    ----------
-    files_content : dict
-        Dictionary containing:
-        {
-            "filename": "file content"
+    Execute end-to-end repository audit using the centralized Groq service.
+    
+    Returns:
+    {
+        "report_markdown": str,
+        "findings": List[Dict[str, Any]],
+        "overall_score": float,
+        "token_usage": Dict[str, int],
+        "model_used": str
+    }
+    """
+    if not files_content:
+        return {
+            "report_markdown": "No repository files were available for analysis.",
+            "findings": [],
+            "overall_score": 0.0,
+            "token_usage": {},
+            "model_used": "none",
         }
 
-    Returns
-    -------
-    str
-        Gemini repository analysis.
-    """
+    # Select high-priority files to respect token budget
+    # Prioritize manifests, configs, main entry points, and source code
+    priority_order = [
+        "requirements.txt",
+        "pyproject.toml",
+        "setup.py",
+        "package.json",
+        "dockerfile",
+        "main.py",
+        "app.py",
+        "index.js",
+        "rag.py",
+        "analyzer.py",
+    ]
 
-    if not files_content:
-        return (
-            "No repository files were available "
-            "for analysis."
-        )
+    sorted_files = sorted(
+        files_content.keys(),
+        key=lambda fn: (
+            0 if any(p in fn.lower() for p in priority_order) else 1,
+            len(files_content[fn]),
+        ),
+    )
 
-    # ========================================================
-    # SYSTEM / ANALYSIS INSTRUCTIONS
-    # ========================================================
+    prompt_files_text = ""
+    max_total_chars = 60000
+    current_chars = 0
 
-    prompt = """
-You are an expert senior software engineer,
-AI engineer, and GitHub repository analyst.
+    for filename in sorted_files:
+        content = files_content[filename]
+        # Cap each file at 10,000 characters
+        snippet = content[:10000]
+        file_block = f"\n\n{'='*60}\nFILE: {filename}\n{'='*60}\n{snippet}"
 
-You are analyzing a real GitHub repository.
+        if current_chars + len(file_block) > max_total_chars:
+            prompt_files_text += f"\n\n[Note: Additional {len(sorted_files) - sorted_files.index(filename)} files omitted to fit context window.]"
+            break
 
-IMPORTANT ACCURACY RULES:
+        prompt_files_text += file_block
+        current_chars += len(file_block)
 
-1. Use ONLY the repository files provided below.
-2. Do NOT invent files, functions, classes, models,
-   technologies, bugs, or features.
-3. Do NOT assume something exists if it is not present
-   in the provided repository context.
-4. Mention the exact filename whenever possible.
-5. If information cannot be determined from the provided
-   files, clearly say:
+    full_user_prompt = f"""
+REPOSITORY NAME: {repo_name}
+TOTAL FILES PRESENT: {len(files_content)}
 
-   "This information cannot be determined from the
-   indexed repository files."
+{ANALYSIS_INSTRUCTION_PROMPT}
 
-6. Distinguish between:
-   - confirmed problems
-   - possible risks
-   - recommendations
-
-7. Do not call something a bug unless the provided code
-   supports that conclusion.
-
-8. When identifying a problem, explain:
-   - What the problem is
-   - Why it happens
-   - Which file contains it
-   - How to fix it
-
-9. When explaining architecture, describe the actual
-   data flow found in the repository.
-
-10. Give technically accurate answers suitable for a
-    professional code review.
-
-============================================================
-REPOSITORY ANALYSIS
-============================================================
-
-Analyze the repository using these sections:
-
-1. PROJECT OVERVIEW
-   - What the project does
-   - Main purpose
-   - Main users/use case
-
-2. ARCHITECTURE
-   - Main components
-   - Data flow
-   - How files interact
-   - AI/ML/RAG components if present
-
-3. TECHNOLOGIES USED
-   - Programming languages
-   - Frameworks
-   - Libraries
-   - Databases
-   - APIs
-   - AI/ML technologies
-
-4. MAIN FILES AND RESPONSIBILITIES
-   Explain the purpose of important files.
-
-5. CODE QUALITY
-   - Good practices
-   - Poor practices
-   - Maintainability
-   - Structure
-
-6. POTENTIAL BUGS OR ISSUES
-   For every confirmed issue:
-   - File
-   - Problem
-   - Cause
-   - Fix
-
-7. SECURITY CONCERNS
-   Only mention security issues supported by
-   the repository files.
-
-8. PERFORMANCE
-   - Current performance concerns
-   - Possible bottlenecks
-   - Improvements
-
-9. AI / RAG ARCHITECTURE
-   If the repository contains AI, RAG, embeddings,
-   vector databases, or LLM functionality:
-   explain how they work together.
-
-10. BEST PRACTICES
-    Give practical improvements based on the
-    actual repository.
-
-11. OVERALL SCORE
-    Give a score out of 10.
-
-    Explain the score based on:
-    - Functionality
-    - Architecture
-    - Code quality
-    - Security
-    - Performance
-    - Maintainability
-
-12. TOP 5 RECOMMENDATIONS
-    Give the five most important improvements
-    in priority order.
-
-============================================================
-IMPORTANT
-============================================================
-
-Do not provide generic advice as if it is a confirmed
-problem in the repository.
-
-Always separate:
-
-CONFIRMED ISSUE
-POSSIBLE RISK
-RECOMMENDATION
-
-============================================================
-REPOSITORY FILES
-============================================================
+REPOSITORY SOURCE CODE:
+{prompt_files_text}
 """
 
-    # ========================================================
-    # ADD FILE CONTENT
-    # ========================================================
+    llm_result = llm_service.generate_completion(
+        messages=[{"role": "user", "content": full_user_prompt}],
+        system_prompt=ANALYSIS_SYSTEM_PROMPT,
+        model=model,
+        temperature=0.1,
+        max_tokens=4000,
+    )
 
-    for filename, content in files_content.items():
+    report_content = llm_result.content
+    findings = extract_structured_findings(report_content)
 
-        if not isinstance(content, str):
-            content = str(content)
+    # Extract score if mentioned
+    score_match = re.search(r"(?:Overall(?:\s+Project)?\s+Health\s+Score|Overall\s+Score)[:\s*]+([0-9]+(?:\.[0-9]+)?)\s*/\s*10", report_content, re.IGNORECASE)
+    overall_score = float(score_match.group(1)) if score_match else 7.0
 
-        # Prevent extremely large prompts
-        limited_content = content[:20000]
-
-        prompt += (
-            "\n\n"
-            + "=" * 70
-            + f"\nFILE: {filename}\n"
-            + "=" * 70
-            + "\n"
-            + limited_content
-        )
-
-    # ========================================================
-    # SEND TO GEMINI
-    # ========================================================
-
-    try:
-
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt
-        )
-
-    except Exception as error:
-
-        raise RuntimeError(
-            f"Gemini API error: {error}"
-        )
-
-    # ========================================================
-    # HANDLE EMPTY RESPONSE
-    # ========================================================
-
-    if not response:
-        raise RuntimeError(
-            "Gemini returned an empty response."
-        )
-
-    if not response.text:
-        raise RuntimeError(
-            "Gemini returned no text in the response."
-        )
-
-    return response.text
-
-
-# ============================================================
-# TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    test_files = {
-        "example.py": """
-def hello():
-    return "Hello GitHub"
-""",
-
-        "requirements.txt": """
-requests
-pandas
-"""
+    return {
+        "report_markdown": report_content,
+        "findings": findings,
+        "overall_score": overall_score,
+        "token_usage": llm_result.usage,
+        "model_used": llm_result.model,
     }
-
-    try:
-
-        result = analyze_repository(
-            test_files
-        )
-
-        print(
-            "\n"
-            + "=" * 70
-        )
-
-        print(
-            "AI REPOSITORY ANALYSIS"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print(result)
-
-    except Exception as error:
-
-        print(
-            f"\n❌ Error: {error}"
-        )

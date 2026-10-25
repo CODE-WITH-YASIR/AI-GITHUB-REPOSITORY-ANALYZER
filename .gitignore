@@ -1,4 +1,6 @@
 .env
+**/.env
+*.env
 venv/
 .venv/
 __pycache__/
@@ -6,3 +8,7 @@ __pycache__/
 chroma_db/
 .vscode/
 .idea/
+.pytest_cache/
+*.log
+dist/
+build/
