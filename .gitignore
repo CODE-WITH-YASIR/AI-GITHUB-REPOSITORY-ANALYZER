@@ -12,3 +12,7 @@ chroma_db/
 *.log
 dist/
 build/
+node_modules/
+.next/
+*.tsbuildinfo
+next-env.d.ts
