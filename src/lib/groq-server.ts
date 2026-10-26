@@ -120,29 +120,53 @@ export async function analyzeRepository(
       (priority.some((p) => b.toLowerCase().includes(p)) ? 0 : 1)
   );
 
-  let promptFiles = "";
-  let totalChars = 0;
-  const MAX_CHARS = 55000;
+  const buildPromptFiles = (maxChars: number, maxSnippet: number) => {
+    let promptFiles = "";
+    let totalChars = 0;
+    for (const filename of sorted) {
+      const snippet = filesContent[filename].slice(0, maxSnippet);
+      const block = `\n\n${"=".repeat(60)}\nFILE: ${filename}\n${"=".repeat(60)}\n${snippet}`;
+      if (totalChars + block.length > maxChars) break;
+      promptFiles += block;
+      totalChars += block.length;
+    }
+    return promptFiles;
+  };
 
-  for (const filename of sorted) {
-    const snippet = filesContent[filename].slice(0, 8000);
-    const block = `\n\n${"=".repeat(60)}\nFILE: ${filename}\n${"=".repeat(60)}\n${snippet}`;
-    if (totalChars + block.length > MAX_CHARS) break;
-    promptFiles += block;
-    totalChars += block.length;
+  // Keep within free-tier ~7,000 ITPM budget (~16,000 chars total)
+  let promptFiles = buildPromptFiles(16000, 2500);
+  let userPrompt = `REPOSITORY: ${repoName}\nTOTAL FILES: ${Object.keys(filesContent).length}\n\n${ANALYSIS_INSTRUCTIONS}\n\nREPOSITORY SOURCE CODE:\n${promptFiles}`;
+
+  let completion;
+  try {
+    completion = await groq.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: ANALYSIS_SYSTEM },
+        { role: "user", content: userPrompt },
+      ],
+      max_tokens: 4096,
+      temperature: 0.1,
+    });
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes("413") || errMsg.includes("rate_limit") || errMsg.includes("too large")) {
+      // Fallback with minimal context if token limit hit
+      promptFiles = buildPromptFiles(7000, 1200);
+      userPrompt = `REPOSITORY: ${repoName}\nTOTAL FILES: ${Object.keys(filesContent).length}\n\n${ANALYSIS_INSTRUCTIONS}\n\nREPOSITORY SOURCE CODE:\n${promptFiles}`;
+      completion = await groq.chat.completions.create({
+        model,
+        messages: [
+          { role: "system", content: ANALYSIS_SYSTEM },
+          { role: "user", content: userPrompt },
+        ],
+        max_tokens: 3000,
+        temperature: 0.1,
+      });
+    } else {
+      throw err;
+    }
   }
-
-  const userPrompt = `REPOSITORY: ${repoName}\nTOTAL FILES: ${Object.keys(filesContent).length}\n\n${ANALYSIS_INSTRUCTIONS}\n\nREPOSITORY SOURCE CODE:\n${promptFiles}`;
-
-  const completion = await groq.chat.completions.create({
-    model,
-    messages: [
-      { role: "system", content: ANALYSIS_SYSTEM },
-      { role: "user", content: userPrompt },
-    ],
-    max_tokens: 4096,
-    temperature: 0.1,
-  });
 
   const content = completion.choices[0]?.message?.content || "";
   const usage = completion.usage;
@@ -173,10 +197,10 @@ export async function chatWithRepository(
   const groq = getGroqClient();
 
   const contextParts = retrievedChunks
-    .slice(0, 8)
+    .slice(0, 5)
     .map(
       (c, i) =>
-        `[${i + 1}] File: ${c.filename} (Chunk ${c.chunkIndex})\n${c.content.slice(0, 3000)}`
+        `[${i + 1}] File: ${c.filename} (Chunk ${c.chunkIndex})\n${c.content.slice(0, 1500)}`
     )
     .join(`\n\n${"=".repeat(50)}\n`);
 
